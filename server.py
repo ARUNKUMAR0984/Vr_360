@@ -1,16 +1,72 @@
 from flask import Flask, request, send_file
 from flask_cors import CORS
-import subprocess
 import os
 import tempfile
 import uuid
+import struct
+import io
 
 app = Flask(__name__)
 CORS(app)
 
+# Spherical Video Metadata Box (UUID)
+SPHERICAL_UUID = bytes([
+    0xFF, 0xE4, 0x81, 0x84, 0xAB, 0xA1, 0xD6, 0x46,
+    0x24, 0xD8, 0x9F, 0xBD, 0xBA, 0xA2, 0x43, 0xF7
+])
+
+SPHERICAL_METADATA = b"""
+<rdf:SphericalVideo xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <SphericalVideo>true</SphericalVideo>
+  <Projection>equirectangular</Projection>
+  <InitialViewHeadingDegrees>0</InitialViewHeadingDegrees>
+  <InitialViewPitchDegrees>0</InitialViewPitchDegrees>
+  <InitialViewRollDegrees>0</InitialViewRollDegrees>
+  <stitched>true</stitched>
+  <stitching_software>360VideoConverter</stitching_software>
+  <stereo_mode>mono</stereo_mode>
+  <source_count>1</source_count>
+</rdf:SphericalVideo>
+""".strip()
+
 @app.route('/health', methods=['GET'])
 def health():
     return {'status': 'ok'}, 200
+
+def inject_spherical_metadata(input_path, output_path):
+    """Inject spherical video metadata into MP4 file"""
+    try:
+        with open(input_path, 'rb') as f:
+            original_data = f.read()
+        
+        # Create UUID box with spherical metadata
+        metadata = SPHERICAL_METADATA
+        uuid_box_size = 8 + 16 + len(metadata)  # size + uuid + data
+        
+        uuid_box = struct.pack('>I', uuid_box_size)  # box size
+        uuid_box += b'uuid'  # box type
+        uuid_box += SPHERICAL_UUID  # UUID
+        uuid_box += metadata  # metadata content
+        
+        # Find mdat box and insert metadata before it
+        mdat_index = original_data.find(b'mdat')
+        
+        if mdat_index > 0:
+            # Find the start of mdat box
+            mdat_start = mdat_index - 4
+            modified_data = original_data[:mdat_start] + uuid_box + original_data[mdat_start:]
+        else:
+            # If no mdat found, append to end
+            modified_data = original_data + uuid_box
+        
+        # Write output
+        with open(output_path, 'wb') as f:
+            f.write(modified_data)
+        
+        return True
+    except Exception as e:
+        print(f"Error injecting metadata: {str(e)}")
+        return False
 
 @app.route('/convert-360', methods=['POST'])
 def convert_360():
@@ -37,40 +93,42 @@ def convert_360():
         if not os.path.exists(input_path):
             return {'error': 'Failed to save input file'}, 500
         
-        # Inject 360 metadata using spatial-media
+        file_size = os.path.getsize(input_path)
+        print(f"[{unique_id}] File size: {file_size / 1024 / 1024:.2f} MB")
+        
+        # Inject 360 metadata
         print(f"[{unique_id}] Starting metadata injection...")
-        cmd = ['python', '-m', 'spatial_media', '-i', input_path, '-o', output_path]
         
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        
-        if result.returncode != 0:
-            print(f"[{unique_id}] Error: {result.stderr}")
-            return {'error': f'Spatial media error: {result.stderr}'}, 500
+        if not inject_spherical_metadata(input_path, output_path):
+            return {'error': 'Failed to inject metadata'}, 500
         
         # Verify output exists
         if not os.path.exists(output_path):
             return {'error': 'Failed to create output file'}, 500
         
-        print(f"[{unique_id}] Metadata injection complete!")
+        output_size = os.path.getsize(output_path)
+        print(f"[{unique_id}] Metadata injection complete! Output size: {output_size / 1024 / 1024:.2f} MB")
         
-        # Send file back
+        # Read output file and send
+        with open(output_path, 'rb') as f:
+            file_data = f.read()
+        
         response = send_file(
-            output_path,
+            io.BytesIO(file_data),
             mimetype='video/mp4',
             as_attachment=True,
             download_name=f'video_360_{unique_id}.mp4'
         )
         
-        # Cleanup input file
+        # Cleanup files
         try:
             os.remove(input_path)
+            os.remove(output_path)
         except:
             pass
         
         return response
     
-    except subprocess.TimeoutExpired:
-        return {'error': 'Processing timeout - video too large'}, 500
     except Exception as e:
         print(f"[{unique_id}] Exception: {str(e)}")
         return {'error': str(e)}, 500
